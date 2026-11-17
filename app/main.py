@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import uuid
 from datetime import date, datetime, timezone
 from typing import Optional
@@ -20,8 +21,8 @@ from typing import Optional
 from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
 from pydantic import BaseModel
 
-from . import core, db
-from .parsing import CsvError, parse_hierarchy_csv, parse_readings_csv
+from . import core, db, ingest
+from .parsing import CsvError, parse_hierarchy_csv
 
 DEFAULT_DB_PATH = os.environ.get(
     "ENERGY_DB_PATH", os.path.join(os.path.dirname(__file__), "..", "data", "energy.db")
@@ -80,6 +81,8 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         version="1.0.0",
     )
     app.state.db_path = os.path.abspath(db_path or DEFAULT_DB_PATH)
+    app.state.staging_dir = ingest.default_staging_dir(app.state.db_path)
+    ingest.sweep_stale(app.state.staging_dir)
     db.init_db(app.state.db_path)
 
     def get_conn(request: Request):
@@ -90,8 +93,10 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             conn.close()
 
     def _record_rejected(conn, kind: str, reason: str) -> None:
-        """拒收批次留痕。独立短事务，不影响主数据。"""
+        """拒收批次留痕。独立短事务，不影响主数据；留痕失败不掩盖原始错误。"""
         try:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 "INSERT INTO batches (batch_id, kind, status, reason, row_count, created_at)"
@@ -100,7 +105,11 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             )
             conn.execute("COMMIT")
         except Exception:
-            conn.execute("ROLLBACK")
+            try:
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+            except Exception:
+                pass
 
     # ---------- 上传：整版层级 ----------
 
@@ -139,42 +148,36 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     # ---------- 上传：一批读数 ----------
 
     @app.post("/api/readings", response_model=BatchResult, summary="按批补传累计电量 CSV")
-    async def upload_readings(file: UploadFile = File(...), conn=Depends(get_conn)):
-        text = await _read_csv_text(file)
+    def upload_readings(
+        request: Request, file: UploadFile = File(...), conn=Depends(get_conn)
+    ):
+        # 同步端点：FastAPI 把它放进线程池，长时间解析不会阻塞其它请求的
+        # 每小时查询；查询与落库各自用自己的连接和事务。
+        batch_id = str(uuid.uuid4())
+        now = _utcnow()
         try:
-            rows = parse_readings_csv(text)  # 批内同键异值在此整批拒收
+            file.file.seek(0)
+            # 阶段一：流式解析 -> 主库同盘临时 SQLite（内存占用有界，整批查同键异值）
+            # 阶段二：单事务合并进主表；此前任何失败都不触碰主表
+            with ingest.StagingArea(request.app.state.staging_dir) as stage:
+                ingest.stage_readings(stage, file.file)
+                # 批内同键异值（含相隔很远的同键）在此整批拒收，同时得到键数
+                row_count = ingest.count_distinct_keys(stage)
+                ingest.merge_into_main(
+                    conn, stage, batch_id=batch_id, now=now, row_count=row_count
+                )
         except CsvError as exc:
             _record_rejected(conn, "readings", str(exc))
             raise HTTPException(status_code=422, detail=str(exc))
+        except (sqlite3.Error, OSError) as exc:
+            # 暂存/落库阶段的 I/O 失败：主表事务已回滚，不留下半批读数。
+            _record_rejected(conn, "readings", f"写入失败: {exc}")
+            raise HTTPException(status_code=500, detail=f"读数批次写入失败: {exc}")
 
-        now = _utcnow()
-        batch_id = str(uuid.uuid4())
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            # 同键异值 = 更正（覆盖）；同值重传 = 幂等（WHERE 条件使其不变）
-            conn.executemany(
-                """
-                INSERT INTO readings (meter_id, ts_utc, kwh, updated_at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT (meter_id, ts_utc) DO UPDATE SET
-                    kwh = excluded.kwh, updated_at = excluded.updated_at
-                WHERE readings.kwh <> excluded.kwh
-                """,
-                [(m, ts, kwh, now) for m, ts, kwh in rows],
-            )
-            conn.execute(
-                "INSERT INTO batches (batch_id, kind, status, reason, row_count, created_at)"
-                " VALUES (?, 'readings', 'applied', NULL, ?, ?)",
-                (batch_id, len(rows), now),
-            )
-            conn.execute("COMMIT")
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
         return BatchResult(
             batch_id=batch_id, status="applied", kind="readings",
-            rows_applied=len(rows),
-            message=f"读数批次已提交，{len(rows)} 个（表号, 整点）键已写入/更正",
+            rows_applied=row_count,
+            message=f"读数批次已提交，{row_count} 个（表号, 整点）键已写入/更正",
         )
 
     # ---------- 查询：逐小时净电量 ----------

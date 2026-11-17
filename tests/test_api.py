@@ -1,11 +1,14 @@
-"""关键场景测试：嵌套扣减、更正、拒收、一致性。"""
+"""关键场景测试：嵌套扣减、更正、拒收、一致性、大批次内存有界。"""
 from __future__ import annotations
 
+import os
 import threading
 
 import pytest
 from fastapi.testclient import TestClient
 
+from app import db, ingest
+from app.db import connect
 from app.main import create_app
 
 DAY = "2026-01-15"
@@ -341,3 +344,174 @@ def test_interleaved_upload_and_query_see_consistent_snapshot(client):
     w.start(); r.start()
     r.join(); stop.set(); w.join(timeout=30)
     assert not errors, errors[:3]
+
+
+# ---------- 6. 大批次与失败回滚（流式解析 + 磁盘暂存） ----------
+
+def _many_unique_rows(n: int) -> list[tuple[str, str, float]]:
+    """n 个互不相同的键：50 只表 x 自 2026-01-01 起的连续整点。"""
+    from datetime import datetime, timedelta, timezone
+
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    rows = []
+    for i in range(n):
+        slot, meter_index = divmod(i, 50)
+        ts = (start + timedelta(hours=slot)).strftime("%Y-%m-%dT%H:00:00Z")
+        rows.append((f"M{meter_index}", ts, float(i)))
+    return rows
+
+
+def test_large_batch_unique_rows_applied(client):
+    # 20k 行足以跨过多个暂存插入块（INSERT_CHUNK=2000），验证分块与合并
+    n = 20_000
+    csv_text = readings_csv(_many_unique_rows(n))
+    resp = upload_readings(client, csv_text)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["rows_applied"] == n
+    conn = connect(client.app.state.db_path)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM readings").fetchone()[0] == n
+    finally:
+        conn.close()
+
+
+def test_large_batch_memory_is_bounded(tmp_path):
+    """解析批次时 Python 堆峰值不随行数线性增长。
+
+    直接走 ingest 层（磁盘文件 + 流式解析），避免把 TestClient 构造的
+    multipart 请求体算进来；比较 60k 与 240k 行的峰值是否基本持平。
+    """
+    import tracemalloc
+
+    def peak_for(n: int) -> int:
+        csv_path = tmp_path / f"r{n}.csv"
+        with open(csv_path, "w") as f:
+            f.write("meter_id,ts_utc,kwh\n")
+            for meter, ts, kwh in _many_unique_rows(n):
+                f.write(f"{meter},{ts},{kwh}\n")
+        db_path = tmp_path / f"m{n}.db"
+        db.init_db(str(db_path))
+        conn = connect(str(db_path))
+        tracemalloc.start()
+        try:
+            with open(csv_path, "rb") as f, ingest.StagingArea(
+                str(tmp_path / "staging")
+            ) as stage:
+                staged = ingest.stage_readings(stage, f)
+                keys = ingest.count_distinct_keys(stage)
+                assert (staged, keys) == (n, n)
+                ingest.merge_into_main(
+                    conn, stage, batch_id="b", now="2026-01-01T00:00:00Z",
+                    row_count=keys,
+                )
+            return tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+            conn.close()
+
+    small = peak_for(60_000)
+    large = peak_for(240_000)
+    # 4 倍行数，Python 堆峰值不应跟着增长；给固定缓冲留 2 倍余量
+    assert large < small * 2 + 4 * 1024 * 1024, (
+        f"60k 峰值 {small / 1e6:.1f}MB，240k 峰值 {large / 1e6:.1f}MB"
+    )
+    assert large < 10 * 1024 * 1024, f"240k 峰值 {large / 1e6:.1f}MB"
+
+
+def test_far_apart_same_key_different_value_rejects_whole_batch(client):
+    # 同键出现在批次首尾，相隔约 2 万行，仍须整批拒收
+    n = 20_000
+    rows = _many_unique_rows(n)
+    first_key, first_val = rows[0][0], rows[0][1]
+    rows.append((first_key, first_val, 999_999.0))
+    resp = upload_readings(client, readings_csv(rows))
+    assert resp.status_code == 422
+    assert "同键异值" in resp.json()["detail"]
+    conn = connect(client.app.state.db_path)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM readings").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_bad_trailing_row_leaves_no_partial_readings(client):
+    rows = _many_unique_rows(5_000)
+    lines = ["meter_id,ts_utc,kwh"] + [f"{m},{t},{v}" for m, t, v in rows]
+    lines.append("M,2026-01-15T00:30:00Z,1.0")  # 尾部非整点 -> 整批拒收
+    resp = upload_readings(client, "\n".join(lines) + "\n")
+    assert resp.status_code == 422 and "整点" in resp.json()["detail"]
+    conn = connect(client.app.state.db_path)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM readings").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_merge_failure_rolls_back_whole_batch(client):
+    """落库阶段真实 SQL 失败（触发器模拟磁盘错误）不得留下部分生效读数。"""
+    rows = _many_unique_rows(5_000)
+    assert upload_readings(client, readings_csv(rows)).status_code == 200
+
+    conn = connect(client.app.state.db_path)
+    try:
+        conn.execute(
+            "CREATE TRIGGER fail_readings BEFORE INSERT ON readings"
+            " BEGIN SELECT RAISE(ABORT, 'simulated disk failure'); END"
+        )
+    finally:
+        conn.close()
+
+    corrected = [(m, t, v + 1.0) for m, t, v in rows[:100]]
+    resp = upload_readings(client, readings_csv(corrected))
+    assert resp.status_code == 500
+    assert "写入失败" in resp.json()["detail"]
+
+    conn = connect(client.app.state.db_path)
+    try:
+        # 原有 5000 行原值未被改动
+        values = conn.execute("SELECT kwh FROM readings").fetchall()
+        assert sorted(r[0] for r in values) == [float(i) for i in range(len(rows))]
+        # 失败的那一批没有被记成 applied
+        applied = conn.execute(
+            "SELECT COUNT(*) FROM batches WHERE status = 'applied'"
+        ).fetchone()[0]
+        assert applied == 1
+        # 失败留痕
+        rejected = conn.execute(
+            "SELECT reason FROM batches WHERE status = 'rejected'"
+        ).fetchall()
+        assert any("写入失败" in r[0] for r in rejected)
+    finally:
+        conn.close()
+
+
+def test_batch_staging_dir_cleaned_up(client):
+    staging_parent = client.app.state.staging_dir
+    before = set(os.listdir(staging_parent)) if os.path.isdir(staging_parent) else set()
+    assert upload_readings(
+        client, readings_csv([("M", "2026-01-15T00:00:00Z", 1.0)])
+    ).status_code == 200
+    # 失败批次同样清理暂存目录
+    bad = readings_csv([("M", "2026-01-15T00:00:00Z", 1.0),
+                        ("M", "2026-01-15T00:00:00Z", 2.0)])
+    assert upload_readings(client, bad).status_code == 422
+    after = set(os.listdir(staging_parent)) if os.path.isdir(staging_parent) else set()
+    assert after == before, f"暂存目录未清理: {after - before}"
+
+
+def test_stale_staging_dirs_swept_on_startup(tmp_path):
+    """上次进程崩溃残留的暂存目录在启动时清掉，不误删新鲜的。"""
+    db_path = tmp_path / "energy.db"
+    first = create_app(str(db_path))
+    staging = first.state.staging_dir
+    stale = os.path.join(staging, "energy-readings-stale")
+    fresh = os.path.join(staging, "energy-readings-fresh")
+    os.makedirs(stale)
+    os.makedirs(fresh)
+    old = 1_000_000_000  # 2001 年，必定超过 24 小时
+    os.utime(stale, (old, old))
+
+    create_app(str(db_path))  # 再次启动触发清扫
+    assert not os.path.exists(stale)
+    assert os.path.exists(fresh)
+

@@ -1,13 +1,16 @@
 """CSV 解析与纯函数校验。
 
-所有解析/校验都不触碰数据库：失败时直接抛 CsvError，调用方据此整次拒收，
-已提交的层级与读数保持原样（"失败后旧结果仍可用"）。
+层级解析仍是纯函数；读数解析提供逐行生成器，调用方边读边校验，不必把整份
+CSV 和全部键放进内存。任何失败都抛 CsvError，调用方据此整次拒收，已提交的
+层级与读数保持原样（"失败后旧结果仍可用"）。
 """
 from __future__ import annotations
 
+import codecs
 import csv
 import io
 import math
+from collections.abc import Iterable, Iterator
 from datetime import datetime, timezone
 
 
@@ -120,22 +123,34 @@ def _detect_cycle(child_to_parent: dict[str, str]) -> None:
             color[n] = BLACK
 
 
-def parse_readings_csv(text: str) -> list[tuple[str, str, float]]:
-    """解析一批读数 CSV，返回去重后的 (meter_id, ts_utc, kwh)。
+def iter_decoded_lines(stream: Iterable[bytes]) -> Iterator[str]:
+    """把上传的二进制流按 UTF-8（可带 BOM）逐行解码，不整份读入内存。"""
+    try:
+        for line in codecs.getreader("utf-8-sig")(stream):
+            yield line
+    except UnicodeDecodeError as exc:
+        raise CsvError("CSV 必须是 UTF-8 编码") from exc
 
-    批内同键同值去重；同键异值整批拒收。
+
+def iter_readings_csv(lines: Iterable[str]) -> Iterator[tuple[str, str, float, int]]:
+    """逐行解析读数 CSV，产出 (meter_id, ts_utc, kwh, lineno)。
+
+    这是生成器：调用方可以边解析边把行写进磁盘暂存，避免 24 万行批次把
+    全部键放进内存。这里只做单行格式校验；批内同键异值需要跨行比较，
+    由调用方的暂存层负责。任何 CsvError 都意味着整批拒收。
     """
-    rows = _rows_from_text(text)
-    if not rows:
+    reader = csv.reader(lines)
+    try:
+        raw_header = next(reader)
+    except StopIteration:
         raise CsvError("CSV 为空")
-    header = rows[0]
+    header = [(cell or "").strip() for cell in raw_header]
     mi = _header_index(header, _METER_HEADERS, "读数")
     ti = _header_index(header, _TS_HEADERS, "读数")
     ki = _header_index(header, _KWH_HEADERS, "读数")
 
-    seen: dict[tuple[str, str], tuple[float, int]] = {}
-    out: list[tuple[str, str, float]] = []
-    for lineno, row in enumerate(rows[1:], start=2):
+    for lineno, raw_row in enumerate(reader, start=2):
+        row = [(cell or "").strip() for cell in raw_row]
         if not any(row):
             continue
         if len(row) <= max(mi, ti, ki):
@@ -151,19 +166,4 @@ def parse_readings_csv(text: str) -> list[tuple[str, str, float]]:
             raise CsvError(f"第 {lineno} 行: kWh 读数不是数值: {raw_kwh!r}")
         if not math.isfinite(kwh):
             raise CsvError(f"第 {lineno} 行: kWh 读数非法（NaN/Inf）: {raw_kwh!r}")
-
-        key = (meter, ts)
-        if key in seen:
-            prev_kwh, prev_lineno = seen[key]
-            if prev_kwh != kwh:
-                raise CsvError(
-                    f"一批内同键异值: 表 {meter!r} 在 {ts} 第 {prev_lineno} 行为 "
-                    f"{prev_kwh}，第 {lineno} 行为 {kwh}，整批拒收"
-                )
-            continue  # 同键同值：幂等去重
-        seen[key] = (kwh, lineno)
-        out.append((meter, ts, kwh))
-
-    if not out:
-        raise CsvError("CSV 没有任何读数数据行")
-    return out
+        yield meter, ts, kwh, lineno
